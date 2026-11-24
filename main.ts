@@ -276,3 +276,133 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
   });
   return edits;
 }
+
+// ---- Section 6: unified diffs ------------------------------------------------
+
+/** One hunk: A is the old start line from its header, O and N its old and new lines. */
+interface Hunk {
+  a: number;
+  o: Seg[];
+  n: Seg[];
+  /** A `\` line follows the hunk's last context or `+` line. */
+  noNewline: boolean;
+  /** A `\` line follows the hunk's last `+` line. */
+  plusNoNewline: boolean;
+}
+
+/** One section of a unified diff, as parsed. A path is undefined when not named,
+ *  null when named as /dev/null. */
+interface Section {
+  diffOld?: string;
+  diffNew?: string;
+  dashOld?: string | null;
+  plusNew?: string | null;
+  renFrom?: string;
+  renTo?: string;
+  create: boolean;
+  del: boolean;
+  hunks: Hunk[];
+  seenHunk: boolean;
+}
+
+/** The path of a `--- ` or `+++ ` line: text after the four characters, up to the
+ *  first tab, surrounding spaces removed, a leading a/ or b/ removed. */
+function diffPath(raw: string): string | null {
+  let t = raw.slice(4).split('\t')[0]!.trim();
+  if (t === '/dev/null') return null;
+  if (t.startsWith('a/') || t.startsWith('b/')) t = t.slice(2);
+  return t;
+}
+
+function parseUnified(lines: string[], strict: boolean): Edit[] {
+  const sections: Section[] = [];
+  let cur: Section | null = null;
+  const n = lines.length;
+  let i = 0;
+  while (i < n) {
+    const L = lines[i]!;
+    if (L.startsWith('diff --git ')) {
+      const m = /^diff --git a\/(.+?) b\/(.+)$/.exec(L);
+      if (m === null) throw new Exit2(`error: parse ${i + 1}`);
+      cur = { diffOld: m[1]!.trim(), diffNew: m[2]!.trim(), create: false, del: false, hunks: [], seenHunk: false };
+      sections.push(cur);
+      i += 1;
+      continue;
+    }
+    if (L.startsWith('@@')) {
+      if (cur === null) throw new Exit2(`error: parse ${i + 1}`);
+      const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(L);
+      if (m === null) throw new Exit2(`error: parse ${i + 1}`);
+      const body: string[] = [];
+      let j = i + 1;
+      while (j < n) {
+        const b = lines[j]!;
+        if (b.startsWith('diff --git ')) break;
+        if (b.startsWith('--- ') && (lines[j + 1] ?? '').startsWith('+++ ')) break;
+        if (b === '' || b.startsWith(' ') || b.startsWith('-') || b.startsWith('+') || b.startsWith('\\')) {
+          body.push(b);
+          j += 1;
+          continue;
+        }
+        break;
+      }
+      while (body.length > 0 && body[body.length - 1] === '') body.pop();
+      const o: Seg[] = [];
+      const nn: Seg[] = [];
+      let lastCtxPlus = -1;
+      let lastPlus = -1;
+      for (let k = 0; k < body.length; k++) {
+        const b = body[k]!;
+        if (b.startsWith('\\')) continue;
+        if (b.startsWith(' ')) {
+          o.push({ text: b.slice(1), ctx: true });
+          nn.push({ text: b.slice(1), ctx: true });
+          lastCtxPlus = k;
+        } else if (b.startsWith('-')) {
+          o.push({ text: b.slice(1), ctx: false });
+        } else if (b.startsWith('+')) {
+          nn.push({ text: b.slice(1), ctx: false });
+          lastCtxPlus = k;
+          lastPlus = k;
+        } else {
+          o.push({ text: '', ctx: true });
+          nn.push({ text: '', ctx: true });
+          lastCtxPlus = k;
+        }
+      }
+      const after = (k: number): boolean => k >= 0 && k + 1 < body.length && body[k + 1]!.startsWith('\\');
+      cur.hunks.push({ a: Number(m[1]), o, n: nn, noNewline: after(lastCtxPlus), plusNoNewline: after(lastPlus) });
+      cur.seenHunk = true;
+      i = j;
+      continue;
+    }
+    if (L.startsWith('--- ')) {
+      const next = lines[i + 1];
+      if (next !== undefined && next.startsWith('+++ ')) {
+        if (cur !== null && !cur.seenHunk) {
+          cur.dashOld = diffPath(L);
+          cur.plusNew = diffPath(next);
+          i += 2;
+          continue;
+        }
+        cur = { dashOld: diffPath(L), plusNew: diffPath(next), create: false, del: false, hunks: [], seenHunk: false };
+        sections.push(cur);
+        i += 2;
+        continue;
+      }
+      if (cur !== null && !cur.seenHunk) throw new Exit2(`error: parse ${i + 2}`);
+      i += 1;
+      continue;
+    }
+    if (cur !== null && !cur.seenHunk) {
+      if (L.startsWith('+++ ')) cur.plusNew = diffPath(L);
+      else if (L.startsWith('rename from ')) cur.renFrom = L.slice(12).trim();
+      else if (L.startsWith('rename to ')) cur.renTo = L.slice(10).trim();
+      else if (L.startsWith('new file mode')) cur.create = true;
+      else if (L.startsWith('deleted file mode')) cur.del = true;
+    }
+    i += 1;
+  }
+  if (sections.length === 0) throw new Exit2('error: parse 1');
+  return sections.map((s) => sectionEdit(s, strict));
+}
