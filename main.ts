@@ -570,3 +570,81 @@ function parseSearchReplace(lines: string[], strict: boolean): Edit[] {
   if (edits.length === 0) throw new Exit2('error: parse 1');
   return edits;
 }
+
+// ---- Section 8: V4A patches --------------------------------------------------
+
+interface V4aChunk {
+  anchor: string | null;
+  o: Seg[];
+  n: Seg[];
+  eof: boolean;
+}
+
+interface VSection {
+  kind: string;
+  path: string;
+  lineNo: number;
+  raw: Array<{ text: string; no: number }>;
+}
+
+function parseV4a(lines: string[], strict: boolean): Edit[] {
+  const first = lines.findIndex((l) => !blank(l));
+  if (first < 0) throw new Exit2('error: parse 1');
+  if (lines[first]!.trim() !== '*** Begin Patch') throw new Exit2(`error: parse ${first + 1}`);
+  let last = -1;
+  for (let k = lines.length - 1; k >= 0; k--) {
+    if (!blank(lines[k]!)) {
+      last = k;
+      break;
+    }
+  }
+  if (lines[last]!.trim() !== '*** End Patch') throw new Exit2(`error: parse ${lines.length + 1}`);
+  const sections: VSection[] = [];
+  let cur: VSection | null = null;
+  for (let k = first + 1; k < last; k++) {
+    const L = lines[k]!;
+    let kind: string | null = null;
+    let path = '';
+    if (L.startsWith('*** Add File: ')) {
+      kind = 'add';
+      path = L.slice(14).trim();
+    } else if (L.startsWith('*** Delete File: ')) {
+      kind = 'delete';
+      path = L.slice(17).trim();
+    } else if (L.startsWith('*** Update File: ')) {
+      kind = 'update';
+      path = L.slice(17).trim();
+    }
+    if (kind !== null) {
+      cur = { kind, path, lineNo: k + 1, raw: [] };
+      sections.push(cur);
+      continue;
+    }
+    if (cur === null) {
+      if (blank(L)) continue;
+      throw new Exit2(`error: parse ${k + 1}`);
+    }
+    cur.raw.push({ text: L, no: k + 1 });
+  }
+  if (sections.length === 0) throw new Exit2('error: parse 1');
+  const edits: Edit[] = [];
+  for (const s of sections) {
+    while (s.raw.length > 0 && blank(s.raw[s.raw.length - 1]!.text)) s.raw.pop();
+    if (s.kind === 'add') {
+      const made: string[] = [];
+      for (const r of s.raw) {
+        if (r.text.startsWith('+')) made.push(r.text.slice(1));
+        else if (r.text === '') made.push('');
+        else throw new Exit2(`error: parse ${r.no}`);
+      }
+      edits.push(v4aAdd(s.path, made));
+    } else if (s.kind === 'delete') {
+      const bad = s.raw.find((r) => !blank(r.text));
+      if (bad !== undefined) throw new Exit2(`error: parse ${bad.no}`);
+      edits.push(v4aDelete(s.path));
+    } else {
+      edits.push(v4aUpdateEdit(s, strict));
+    }
+  }
+  return edits;
+}
