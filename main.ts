@@ -95,3 +95,89 @@ class Tree {
 }
 
 type Edit = (tree: Tree) => void;
+
+// ---- Section 5: matching lines ---------------------------------------------
+
+const trimEndWs = (s: string): string => s.replace(/[ \t]+$/, '');
+const trimBothWs = (s: string): string => s.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
+const leadWs = (s: string): string => (/^[ \t]*/.exec(s) ?? [''])[0]!;
+
+/** One line of O or N. A context line also occurs in the other side, and is written
+ *  as the file's own matched line, never the patch's. */
+interface Seg {
+  text: string;
+  ctx: boolean;
+}
+
+/** Positions i where O matches the file's lines starting at i, at one tier. */
+function occurrencesAt(file: string[], o: string[], tier: number): number[] {
+  const eq =
+    tier === 0
+      ? (a: string, b: string): boolean => a === b
+      : tier === 1
+        ? (a: string, b: string): boolean => trimEndWs(a) === trimEndWs(b)
+        : (a: string, b: string): boolean => trimBothWs(a) === trimBothWs(b);
+  const out: number[] = [];
+  for (let i = 0; i + o.length <= file.length; i++) {
+    let ok = true;
+    for (let j = 0; j < o.length; j++) {
+      if (!eq(file[i + j]!, o[j]!)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) out.push(i);
+  }
+  return out;
+}
+
+/** The first tier (0, 1, 2; only 0 when strict) at which O occurs at least once,
+ *  and every position there, or null when O occurs at no tier. */
+function firstTier(file: string[], o: string[], strict: boolean): { tier: number; at: number[] } | null {
+  const top = strict ? 0 : 2;
+  for (let tier = 0; tier <= top; tier++) {
+    const at = occurrencesAt(file, o, tier);
+    if (at.length > 0) return { tier, at };
+  }
+  return null;
+}
+
+/** The lines N writes when it replaces O matched at position `pos` in `file`.
+ *  Context lines come from the file; at tier 2 the other lines are re-indented. */
+function replacedLines(file: string[], o: Seg[], n: Seg[], tier: number, pos: number): string[] {
+  const oCtx = o.map((s, i) => (s.ctx ? i : -1)).filter((i) => i >= 0);
+  let seenCtx = -1;
+  const p = o.length > 0 ? leadWs(o[0]!.text) : '';
+  const f = o.length > 0 ? leadWs(file[pos]!) : '';
+  return n.map((s) => {
+    if (s.ctx) {
+      seenCtx += 1;
+      return file[pos + oCtx[seenCtx]!]!;
+    }
+    if (tier === 2 && s.text !== '' && s.text.trim() !== '' && s.text.startsWith(p)) {
+      return f + s.text.slice(p.length);
+    }
+    return s.text;
+  });
+}
+
+/** Positions at or after `from` where the single line `want` matches, at the first
+ *  tier with one, or null. Used for V4A anchors. */
+function anchorAt(file: string[], want: string, from: number, strict: boolean): number | null {
+  const found = firstTier(file.slice(from), [want], strict);
+  if (found === null) return null;
+  return from + found.at[0]!;
+}
+
+// ---- Section 4: detecting the format ---------------------------------------
+
+function detect(lines: string[]): string | null {
+  const first = lines.findIndex((l) => !blank(l));
+  if (first < 0) return null;
+  if (lines[first]!.trim() === '*** Begin Patch') return 'v4a';
+  const c = lines[first]!.trimStart()[0];
+  if (c === '[' || c === '{') return 'json';
+  if (lines.some((l) => l.trimEnd() === '<<<<<<< SEARCH')) return 'search-replace';
+  if (lines.some((l, i) => l.startsWith('diff --git ') || (l.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')))) return 'unified';
+  return null;
+}
