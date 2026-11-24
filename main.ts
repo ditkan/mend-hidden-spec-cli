@@ -496,3 +496,77 @@ function sectionEdit(s: Section, strict: boolean): Edit {
     tree.now.set(target, joinText(st));
   };
 }
+
+// ---- Section 7: SEARCH/REPLACE blocks ---------------------------------------
+
+function srEdit(path: string, oldLines: string[], newLines: string[], strict: boolean): Edit {
+  return (tree) => {
+    if (!safe(path)) throw new Fail('unsafe', path);
+    if (oldLines.length === 0) {
+      if (tree.get(path) !== null) throw new Fail('exists', path);
+      tree.now.set(path, newLines.length === 0 ? '' : newLines.join('\n') + '\n');
+      return;
+    }
+    const before = tree.get(path);
+    if (before === null) throw new Fail('missing', path);
+    const st = splitText(before);
+    const found = firstTier(st.lines, oldLines, strict);
+    if (found === null) throw new Fail('no-match', path);
+    if (found.at.length > 1) throw new Fail('ambiguous', path);
+    const pos = found.at[0]!;
+    const o: Seg[] = oldLines.map((t) => ({ text: t, ctx: false }));
+    const nn: Seg[] = newLines.map((t) => ({ text: t, ctx: false }));
+    const out = replacedLines(st.lines, o, nn, found.tier, pos);
+    st.lines.splice(pos, oldLines.length, ...out);
+    tree.now.set(path, joinText(st));
+  };
+}
+
+function parseSearchReplace(lines: string[], strict: boolean): Edit[] {
+  const edits: Edit[] = [];
+  const n = lines.length;
+  let prevEnd = -1;
+  let prevPath: string | null = null;
+  let i = 0;
+  while (i < n) {
+    if (lines[i]!.trimEnd() !== '<<<<<<< SEARCH') {
+      i += 1;
+      continue;
+    }
+    const searchLine = i;
+    let path: string | null = null;
+    for (let k = searchLine - 1; k > prevEnd; k--) {
+      const t = lines[k]!.trim();
+      if (t === '' || t.startsWith('```')) continue;
+      path = t;
+      break;
+    }
+    if (path === null) path = prevPath;
+    if (path === null) throw new Exit2(`error: parse ${searchLine + 1}`);
+    let eq = -1;
+    for (let k = searchLine + 1; k < n; k++) {
+      if (lines[k]!.trimEnd() === '<<<<<<< SEARCH') break;
+      if (lines[k]!.trimEnd() === '=======') {
+        eq = k;
+        break;
+      }
+    }
+    let rep = -1;
+    if (eq >= 0) {
+      for (let k = eq + 1; k < n; k++) {
+        if (lines[k]!.trimEnd() === '<<<<<<< SEARCH') break;
+        if (lines[k]!.trimEnd() === '>>>>>>> REPLACE') {
+          rep = k;
+          break;
+        }
+      }
+    }
+    if (eq < 0 || rep < 0) throw new Exit2(`error: parse ${searchLine + 1}`);
+    edits.push(srEdit(path, lines.slice(searchLine + 1, eq), lines.slice(eq + 1, rep), strict));
+    prevPath = path;
+    prevEnd = rep;
+    i = rep + 1;
+  }
+  if (edits.length === 0) throw new Exit2('error: parse 1');
+  return edits;
+}
