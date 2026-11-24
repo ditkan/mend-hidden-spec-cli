@@ -648,3 +648,120 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
   }
   return edits;
 }
+
+function v4aAdd(path: string, made: string[]): Edit {
+  return (tree) => {
+    if (!safe(path)) throw new Fail('unsafe', path);
+    if (tree.get(path) !== null) throw new Fail('exists', path);
+    tree.now.set(path, made.length === 0 ? '' : made.join('\n') + '\n');
+  };
+}
+
+function v4aDelete(path: string): Edit {
+  return (tree) => {
+    if (!safe(path)) throw new Fail('unsafe', path);
+    if (tree.get(path) === null) throw new Fail('missing', path);
+    tree.now.set(path, null);
+  };
+}
+
+/** Apply one V4A chunk at the cursor; returns the cursor after the lines written. */
+function applyV4aChunk(st: Split, c: V4aChunk, strict: boolean, path: string, cursor: number): number {
+  if (c.anchor !== null) {
+    const at = anchorAt(st.lines, c.anchor, cursor, strict);
+    if (at === null) throw new Fail('no-match', path);
+    cursor = at + 1;
+  }
+  const oTexts = c.o.map((s) => s.text);
+  if (c.o.length === 0) {
+    const pos = c.eof ? st.lines.length : cursor;
+    st.lines.splice(pos, 0, ...c.n.map((s) => s.text));
+    return pos + c.n.length;
+  }
+  let found: { tier: number; at: number[] } | null = null;
+  for (let tier = 0; tier <= (strict ? 0 : 2); tier++) {
+    let at = occurrencesAt(st.lines, oTexts, tier).filter((p) => p >= cursor);
+    if (c.eof) at = at.filter((p) => p + oTexts.length === st.lines.length);
+    if (at.length > 0) {
+      found = { tier, at };
+      break;
+    }
+  }
+  if (found === null) throw new Fail('no-match', path);
+  const pos = found.at[0]!;
+  const out = replacedLines(st.lines, c.o, c.n, found.tier, pos);
+  st.lines.splice(pos, c.o.length, ...out);
+  return pos + out.length;
+}
+
+function v4aUpdate(path: string, moveTo: string | undefined, chunks: V4aChunk[], strict: boolean): Edit {
+  return (tree) => {
+    if (!safe(path)) throw new Fail('unsafe', path);
+    if (moveTo !== undefined && !safe(moveTo)) throw new Fail('unsafe', moveTo);
+    const before = tree.get(path);
+    if (before === null) throw new Fail('missing', path);
+    if (moveTo !== undefined && tree.get(moveTo) !== null) throw new Fail('exists', moveTo);
+    const st = splitText(before);
+    let cursor = 0;
+    for (const c of chunks) cursor = applyV4aChunk(st, c, strict, path, cursor);
+    const out = joinText(st);
+    if (moveTo !== undefined) {
+      tree.now.set(path, null);
+      tree.now.set(moveTo, out);
+      tree.moves.push([path, moveTo]);
+    } else {
+      tree.now.set(path, out);
+    }
+  };
+}
+
+/** Parse an Update File section's chunks from its raw lines. */
+function v4aUpdateEdit(s: VSection, strict: boolean): Edit {
+  let idx = 0;
+  let moveTo: string | undefined;
+  if (s.raw.length > 0 && s.raw[0]!.text.startsWith('*** Move to: ')) {
+    moveTo = s.raw[0]!.text.slice(13).trim();
+    idx = 1;
+  }
+  const chunks: V4aChunk[] = [];
+  let cur: V4aChunk | null = null;
+  for (; idx < s.raw.length; idx++) {
+    const r = s.raw[idx]!;
+    const L = r.text;
+    if (L.startsWith('@@')) {
+      const anchor = L.slice(2).trim();
+      cur = { anchor: anchor === '' ? null : anchor, o: [], n: [], eof: false };
+      chunks.push(cur);
+      continue;
+    }
+    if (L === '*** End of File') {
+      if (cur === null) throw new Exit2(`error: parse ${r.no}`);
+      cur.eof = true;
+      cur = null;
+      continue;
+    }
+    if (L.startsWith('***')) throw new Exit2(`error: parse ${r.no}`);
+    if (L.startsWith(' ') || L.startsWith('-') || L.startsWith('+') || L === '') {
+      if (cur === null) {
+        if (chunks.length > 0) throw new Exit2(`error: parse ${r.no}`);
+        cur = { anchor: null, o: [], n: [], eof: false };
+        chunks.push(cur);
+      }
+      if (L.startsWith(' ')) {
+        cur.o.push({ text: L.slice(1), ctx: true });
+        cur.n.push({ text: L.slice(1), ctx: true });
+      } else if (L.startsWith('-')) {
+        cur.o.push({ text: L.slice(1), ctx: false });
+      } else if (L.startsWith('+')) {
+        cur.n.push({ text: L.slice(1), ctx: false });
+      } else {
+        cur.o.push({ text: '', ctx: true });
+        cur.n.push({ text: '', ctx: true });
+      }
+      continue;
+    }
+    throw new Exit2(`error: parse ${r.no}`);
+  }
+  if (chunks.length === 0 && moveTo === undefined) throw new Exit2(`error: parse ${s.lineNo}`);
+  return v4aUpdate(s.path, moveTo, chunks, strict);
+}
