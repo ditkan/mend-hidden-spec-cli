@@ -406,3 +406,93 @@ function parseUnified(lines: string[], strict: boolean): Edit[] {
   if (sections.length === 0) throw new Exit2('error: parse 1');
   return sections.map((s) => sectionEdit(s, strict));
 }
+
+/** Apply one hunk to the file's split text, at offset d from earlier hunks. */
+function applyHunk(st: Split, h: Hunk, strict: boolean, path: string, d: number): void {
+  if (h.o.length === 0) {
+    const pos = Math.min(Math.max(h.a + d, 0), st.lines.length);
+    const atEnd = pos === st.lines.length;
+    st.lines.splice(pos, 0, ...h.n.map((s) => s.text));
+    if (atEnd) st.final = !h.noNewline;
+    return;
+  }
+  const oTexts = h.o.map((s) => s.text);
+  const found = firstTier(st.lines, oTexts, strict);
+  if (found === null) throw new Fail('no-match', path);
+  const want = h.a - 1 + d;
+  let best = found.at[0]!;
+  for (const p of found.at) {
+    if (Math.abs(p - want) < Math.abs(best - want)) best = p;
+  }
+  const pos = best;
+  const toEnd = pos + h.o.length === st.lines.length;
+  const out = replacedLines(st.lines, h.o, h.n, found.tier, pos);
+  st.lines.splice(pos, h.o.length, ...out);
+  if (toEnd) st.final = !h.noNewline;
+}
+
+/** Apply a section's hunks in order, each to the result of the ones before it. */
+function applyHunks(st: Split, hunks: Hunk[], strict: boolean, path: string): void {
+  let d = 0;
+  for (const h of hunks) {
+    applyHunk(st, h, strict, path, d);
+    d += h.n.length - h.o.length;
+  }
+}
+
+/** One section is one edit: a creation, a deletion, a move, or a change. */
+function sectionEdit(s: Section, strict: boolean): Edit {
+  const oldP = s.dashOld !== undefined ? s.dashOld : s.renFrom !== undefined ? s.renFrom : s.diffOld;
+  const newP = s.plusNew !== undefined ? s.plusNew : s.renTo !== undefined ? s.renTo : s.diffNew;
+  if (oldP === null || s.create) {
+    const target = newP;
+    return (tree) => {
+      if (target === null || target === undefined) return;
+      if (!safe(target)) throw new Fail('unsafe', target);
+      if (tree.get(target) !== null) throw new Fail('exists', target);
+      const made: string[] = [];
+      for (const h of s.hunks) made.push(...h.n.filter((x) => !x.ctx).map((x) => x.text));
+      let noNl = false;
+      for (let k = s.hunks.length - 1; k >= 0; k--) {
+        if (s.hunks[k]!.n.some((x) => !x.ctx)) {
+          noNl = s.hunks[k]!.plusNoNewline;
+          break;
+        }
+      }
+      tree.now.set(target, made.length === 0 ? '' : made.join('\n') + (noNl ? '' : '\n'));
+    };
+  }
+  if (newP === null || s.del) {
+    const target = oldP;
+    return (tree) => {
+      if (target === undefined) return;
+      if (!safe(target)) throw new Fail('unsafe', target);
+      if (tree.get(target) === null) throw new Fail('missing', target);
+      tree.now.set(target, null);
+    };
+  }
+  if (oldP !== undefined && newP !== undefined && oldP !== newP) {
+    return (tree) => {
+      if (!safe(oldP)) throw new Fail('unsafe', oldP);
+      if (!safe(newP)) throw new Fail('unsafe', newP);
+      const before = tree.get(oldP);
+      if (before === null) throw new Fail('missing', oldP);
+      if (tree.get(newP) !== null) throw new Fail('exists', newP);
+      const st = splitText(before);
+      applyHunks(st, s.hunks, strict, oldP);
+      tree.now.set(oldP, null);
+      tree.now.set(newP, joinText(st));
+      tree.moves.push([oldP, newP]);
+    };
+  }
+  const target = oldP;
+  return (tree) => {
+    if (target === undefined) return;
+    if (!safe(target)) throw new Fail('unsafe', target);
+    const before = tree.get(target);
+    if (before === null) throw new Fail('missing', target);
+    const st = splitText(before);
+    applyHunks(st, s.hunks, strict, target);
+    tree.now.set(target, joinText(st));
+  };
+}
