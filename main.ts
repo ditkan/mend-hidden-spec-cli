@@ -765,3 +765,103 @@ function v4aUpdateEdit(s: VSection, strict: boolean): Edit {
   if (chunks.length === 0 && moveTo === undefined) throw new Exit2(`error: parse ${s.lineNo}`);
   return v4aUpdate(s.path, moveTo, chunks, strict);
 }
+
+// ---- Sections 1, 2, 10: invocation, output, order and atomicity -------------
+
+function run(args: string[]): { code: number; out: string[] } {
+  let format: string | null = null;
+  let check = false;
+  let strict = false;
+  const pos: string[] = [];
+  let ended = false;
+  for (const a of args) {
+    if (!ended && a === '--') ended = true;
+    else if (!ended && a.startsWith('-') && a !== '-') {
+      if (a.startsWith('--format=') && format === null && FORMATS.includes(a.slice(9))) format = a.slice(9);
+      else if (a === '--check' && !check) check = true;
+      else if (a === '--strict' && !strict) strict = true;
+      else return { code: 2, out: ['error: usage'] };
+    } else pos.push(a);
+  }
+  if (pos.length > 1) return { code: 2, out: ['error: usage'] };
+  const file = pos.length === 0 || pos[0] === '-' ? null : pos[0]!;
+  let text = '';
+  try {
+    text = readFileSync(file ?? 0, 'utf8');
+  } catch {
+    if (file !== null) return { code: 2, out: ['error: no-patch'] };
+  }
+  const lines = patchLines(text);
+  const kind = format === null || format === 'auto' ? detect(lines) : format;
+  if (kind === null) return { code: 2, out: ['error: format'] };
+  let edits: Edit[];
+  try {
+    if (kind === 'json') edits = jsonEdits(text, lines);
+    else if (kind === 'unified') edits = parseUnified(lines, strict);
+    else if (kind === 'search-replace') edits = parseSearchReplace(lines, strict);
+    else edits = parseV4a(lines, strict);
+    if (edits.length === 0) throw new Exit2('error: parse 1');
+  } catch (e) {
+    if (e instanceof Exit2) return { code: 2, out: [e.line] };
+    throw e;
+  }
+  const tree = new Tree();
+  const fails: Fail[] = [];
+  for (const edit of edits) {
+    const before = new Map(tree.now);
+    const movesBefore = tree.moves.length;
+    try {
+      edit(tree);
+    } catch (e) {
+      if (!(e instanceof Fail)) throw e;
+      tree.now.clear();
+      for (const [k, v] of before) tree.now.set(k, v);
+      tree.moves.length = movesBefore;
+      fails.push(e);
+    }
+  }
+  if (fails.length > 0) {
+    return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
+  }
+  const rows: Array<{ key: string; line: string }> = [];
+  const hidden = new Set<string>();
+  for (const [oldP, newP] of tree.moves) {
+    if (tree.original(oldP) !== null && tree.get(oldP) === null && tree.original(newP) === null && tree.get(newP) !== null) {
+      rows.push({ key: newP, line: `R ${oldP} -> ${newP}` });
+      hidden.add(oldP);
+      hidden.add(newP);
+    }
+  }
+  for (const p of [...tree.now.keys()]) {
+    if (hidden.has(p)) continue;
+    const was = tree.original(p);
+    const now = tree.now.get(p)!;
+    if (was === now) continue;
+    rows.push({ key: p, line: `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}` });
+  }
+  rows.sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key)));
+  if (!check) {
+    for (const p of [...tree.now.keys()]) {
+      if (tree.now.get(p) === null) rmSync(p, { force: true });
+    }
+    for (const p of [...tree.now.keys()]) {
+      const was = tree.original(p);
+      const now = tree.now.get(p)!;
+      if (was === now || now === null) continue;
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, now);
+    }
+  }
+  return { code: 0, out: [...rows.map((r) => r.line), `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
+}
+
+const trialEnv = process.env.MAKEFUN_ENV_URL;
+if (trialEnv !== undefined && trialEnv !== '') {
+  // A trial: the kit's runner reads the checks from the env and runs this file on each one, without this variable.
+  const { runTrial } = await import('./runner.ts');
+  await runTrial(trialEnv);
+} else {
+  const r = run(process.argv.slice(2));
+  writeSync(1, r.out.map((l) => `${l}\n`).join(''));
+  process.exitCode = r.code;
+}
